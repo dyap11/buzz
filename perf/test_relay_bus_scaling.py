@@ -147,6 +147,18 @@ class ScalingContractTests(unittest.TestCase):
         self.assertEqual([row.new_irrelevant_pct for row in rows], [0.0, 0.0, 0.0])
         harness.assert_scaling(args, rows)
 
+    def test_model_fractional_rate_below_one_stays_exact_and_passes(self) -> None:
+        # Review finding R1: a 0.5 events/s scenario has a one-pod scoped rate of
+        # 0.5, which must not be truncated to zero and then fail as "no deliveries".
+        args = make_args(events_per_community_per_sec=0.5)
+        rows = harness.model_measurements(args, [1, 2, 4])
+
+        self.assertEqual([row.new_cluster for row in rows], [0.5, 1.0, 2.0])
+        self.assertEqual([row.old_cluster for row in rows], [32.0, 64.0, 128.0])
+        self.assertEqual([row.published for row in rows], [32.0, 32.0, 32.0])
+        self.assertEqual([row.reduction for row in rows], [64.0, 64.0, 64.0])
+        harness.assert_scaling(args, rows)
+
     def test_assertion_fails_when_scoped_bus_receives_irrelevant_messages(self) -> None:
         mutant_row = make_row(
             new_cluster=25_600,
@@ -163,6 +175,14 @@ class ScalingContractTests(unittest.TestCase):
         mutant_row = make_row(new_cluster=0, new_avg_pod=0.0, reduction=math.inf)
         with self.assertRaisesRegex(AssertionError, "pods=4"):
             harness.assert_scaling(make_args(), [mutant_row])
+
+    def test_assertion_fails_on_true_zero_redis_delivery_with_fractional_args(self) -> None:
+        # Integer zero as a Redis-mode subscriber would report it, under the same
+        # fractional-rate arguments that model mode now accepts.
+        mutant_row = make_row(pods=1, old_cluster=32, old_avg_pod=32.0, new_cluster=0,
+                              new_avg_pod=0.0, reduction=math.inf, published=32)
+        with self.assertRaisesRegex(AssertionError, "no deliveries"):
+            harness.assert_scaling(make_args(events_per_community_per_sec=0.5), [mutant_row])
 
     def test_assertion_fails_on_zero_global_deliveries(self) -> None:
         mutant_row = make_row(old_cluster=0, old_avg_pod=0.0, reduction=0.0)
@@ -187,7 +207,7 @@ class ScalingContractTests(unittest.TestCase):
 
 
 class ValidateArgsTests(unittest.TestCase):
-    RATES = (math.nan, math.inf, -math.inf, 0.0, -100.0, 1.5, 100.0)
+    RATES = (math.nan, math.inf, -math.inf, 0.0, -100.0, 0.5, 1.5, 100.0)
     INTERESTED = (-1, 0, 3)
 
     @staticmethod
@@ -244,12 +264,14 @@ class ValidateArgsTests(unittest.TestCase):
                         harness.run(make_args(mode="redis", **overrides))
                 connect.assert_not_called()
 
-    def test_model_mode_run_accepts_fractional_rate_without_connecting(self) -> None:
-        connect = mock.Mock(side_effect=AssertionError("connection must not be opened"))
-        with mock.patch.object(harness.socket, "create_connection", connect):
-            with mock.patch("builtins.print"):
-                self.assertEqual(harness.run(make_args(events_per_community_per_sec=2.5)), 0)
-        connect.assert_not_called()
+    def test_model_mode_run_accepts_fractional_rates_without_connecting(self) -> None:
+        for rate in (0.5, 2.5):
+            with self.subTest(rate=rate):
+                connect = mock.Mock(side_effect=AssertionError("connection must not be opened"))
+                with mock.patch.object(harness.socket, "create_connection", connect):
+                    with mock.patch("builtins.print"):
+                        self.assertEqual(harness.run(make_args(events_per_community_per_sec=rate)), 0)
+                connect.assert_not_called()
 
 
 class RespCodecTests(unittest.TestCase):

@@ -71,15 +71,18 @@ class Scenario:
 
 @dataclass(frozen=True)
 class Measurement:
+    """One pod-count row. Counts are integers in redis mode and may be
+    fractional rates in model mode (for example a 0.5 events/s scenario)."""
+
     pods: int
-    old_cluster: int
+    old_cluster: float
     old_avg_pod: float
     old_irrelevant_pct: float
-    new_cluster: int
+    new_cluster: float
     new_avg_pod: float
     new_irrelevant_pct: float
     reduction: float
-    published: int
+    published: float
 
 
 @dataclass(frozen=True)
@@ -432,17 +435,19 @@ def model_measurements(args: argparse.Namespace, pods_values: list[int]) -> list
         )
         old_cluster, old_pod, old_irrelevant = scenario.old_global_firehose()
         new_cluster, new_pod, new_irrelevant = scenario.scoped_bus()
+        # Model rates stay as floats: truncating a sub-one scoped rate (for
+        # example 0.5 events/s on one pod) to int would read as zero deliveries.
         rows.append(
             Measurement(
                 pods=pods,
-                old_cluster=int(old_cluster),
+                old_cluster=old_cluster,
                 old_avg_pod=old_pod,
                 old_irrelevant_pct=old_irrelevant,
-                new_cluster=int(new_cluster),
+                new_cluster=new_cluster,
                 new_avg_pod=new_pod,
                 new_irrelevant_pct=new_irrelevant,
                 reduction=old_cluster / new_cluster if new_cluster else float("inf"),
-                published=int(scenario.total_event_rate),
+                published=scenario.total_event_rate,
             )
         )
     return rows
