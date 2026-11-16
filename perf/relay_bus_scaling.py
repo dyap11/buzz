@@ -19,13 +19,14 @@ Modes:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import socket
 import threading
 import time
 from dataclasses import dataclass
 from typing import BinaryIO
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from uuid import UUID
 
 BUZZ_PREFIX = "buzz"
@@ -70,15 +71,18 @@ class Scenario:
 
 @dataclass(frozen=True)
 class Measurement:
+    """One pod-count row. Counts are integers in redis mode and may be
+    fractional rates in model mode (for example a 0.5 events/s scenario)."""
+
     pods: int
-    old_cluster: int
+    old_cluster: float
     old_avg_pod: float
     old_irrelevant_pct: float
-    new_cluster: int
+    new_cluster: float
     new_avg_pod: float
     new_irrelevant_pct: float
     reduction: float
-    published: int
+    published: float
 
 
 @dataclass(frozen=True)
@@ -153,27 +157,38 @@ def read_resp(stream: BinaryIO) -> object:
     raise ValueError(f"unknown Redis RESP prefix: {prefix!r}")
 
 
+def send_command(stream: BinaryIO, *parts: object) -> object:
+    """Write one RESP command frame and return the decoded reply."""
+    stream.write(encode_command(*parts))
+    stream.flush()
+    return read_resp(stream)
+
+
+def authenticate_and_select(stream: BinaryIO, address: RedisAddress) -> None:
+    """Shared connection preamble for the client and every subscriber.
+
+    Credentials are sent exactly as stored on ``address``; ``parse_redis_url``
+    has already percent-decoded them.
+    """
+    if address.password:
+        if address.username:
+            send_command(stream, "AUTH", address.username, address.password)
+        else:
+            send_command(stream, "AUTH", address.password)
+    if address.db:
+        send_command(stream, "SELECT", address.db)
+
+
 class RedisClient:
     def __init__(self, address: RedisAddress, timeout: float) -> None:
         self._address = address
         self._sock = socket.create_connection((address.host, address.port), timeout=timeout)
         self._sock.settimeout(timeout)
         self._stream = self._sock.makefile("rwb")
-        self._authenticate_and_select()
-
-    def _authenticate_and_select(self) -> None:
-        if self._address.password:
-            if self._address.username:
-                self.command("AUTH", self._address.username, self._address.password)
-            else:
-                self.command("AUTH", self._address.password)
-        if self._address.db:
-            self.command("SELECT", self._address.db)
+        authenticate_and_select(self._stream, address)
 
     def command(self, *parts: object) -> object:
-        self._stream.write(encode_command(*parts))
-        self._stream.flush()
-        return read_resp(self._stream)
+        return send_command(self._stream, *parts)
 
     def close(self) -> None:
         try:
@@ -217,13 +232,7 @@ class RedisSubscriber(threading.Thread):
             sock.settimeout(0.2)
             stream = sock.makefile("rwb")
             try:
-                if self.address.password:
-                    if self.address.username:
-                        self._write_and_read(stream, "AUTH", self.address.username, self.address.password)
-                    else:
-                        self._write_and_read(stream, "AUTH", self.address.password)
-                if self.address.db:
-                    self._write_and_read(stream, "SELECT", self.address.db)
+                authenticate_and_select(stream, self.address)
 
                 stream.write(encode_command("SUBSCRIBE", *self.channels))
                 stream.flush()
@@ -257,12 +266,6 @@ class RedisSubscriber(threading.Thread):
             self.error = exc
             self.ready.set()
 
-    @staticmethod
-    def _write_and_read(stream: BinaryIO, *parts: object) -> object:
-        stream.write(encode_command(*parts))
-        stream.flush()
-        return read_resp(stream)
-
     def stop(self) -> None:
         self.stop_requested.set()
         if self._sock is not None:
@@ -277,17 +280,25 @@ class RedisSubscriber(threading.Thread):
 
 
 def parse_redis_url(raw: str) -> RedisAddress:
+    """Parse ``redis://[user[:password]@]host[:port][/db]``.
+
+    Username and password are percent-decoded so that reserved characters
+    (``@``, ``:``, ``/``) can be carried in ``REDIS_URL`` as ``%40``, ``%3A``,
+    ``%2F`` and reach Redis in their literal form.
+    """
     parsed = urlparse(raw)
     if parsed.scheme not in {"redis", "rediss"}:
         raise ValueError(f"unsupported Redis URL scheme: {parsed.scheme!r}")
     if parsed.scheme == "rediss":
         raise ValueError("rediss:// is not supported by this stdlib harness; use redis://")
+    username = unquote(parsed.username) if parsed.username else None
+    password = unquote(parsed.password) if parsed.password else None
     return RedisAddress(
         host=parsed.hostname or "127.0.0.1",
         port=parsed.port or 6379,
         db=int(parsed.path.lstrip("/") or "0"),
-        username=parsed.username,
-        password=parsed.password,
+        username=username,
+        password=password,
     )
 
 
@@ -316,6 +327,10 @@ def wait_until_ready(subscribers: list[RedisSubscriber], timeout: float) -> None
 
 
 def wait_for_counts(subscribers: list[RedisSubscriber], expected_total: int, timeout: float) -> None:
+    if expected_total <= 0:
+        # A non-positive target would be satisfied by zero deliveries and turn a
+        # dead bus into a PASS. The caller's inputs are wrong; say so.
+        raise ValueError(f"expected pub/sub delivery total must be positive, got {expected_total}")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if any(sub.error for sub in subscribers):
@@ -336,8 +351,6 @@ def stop_subscribers(subscribers: list[RedisSubscriber]) -> None:
 
 def measure_redis_for_pods(args: argparse.Namespace, pods: int) -> Measurement:
     events_per_community = int(args.events_per_community_per_sec)
-    if events_per_community != args.events_per_community_per_sec:
-        raise ValueError("--mode redis requires integer --events-per-community-per-sec")
     address = parse_redis_url(args.redis_url)
     communities = [community_id(i) for i in range(args.communities)]
     relevant = set(communities[: args.subscribed_communities])
@@ -422,17 +435,19 @@ def model_measurements(args: argparse.Namespace, pods_values: list[int]) -> list
         )
         old_cluster, old_pod, old_irrelevant = scenario.old_global_firehose()
         new_cluster, new_pod, new_irrelevant = scenario.scoped_bus()
+        # Model rates stay as floats: truncating a sub-one scoped rate (for
+        # example 0.5 events/s on one pod) to int would read as zero deliveries.
         rows.append(
             Measurement(
                 pods=pods,
-                old_cluster=int(old_cluster),
+                old_cluster=old_cluster,
                 old_avg_pod=old_pod,
                 old_irrelevant_pct=old_irrelevant,
-                new_cluster=int(new_cluster),
+                new_cluster=new_cluster,
                 new_avg_pod=new_pod,
                 new_irrelevant_pct=new_irrelevant,
                 reduction=old_cluster / new_cluster if new_cluster else float("inf"),
-                published=int(scenario.total_event_rate),
+                published=scenario.total_event_rate,
             )
         )
     return rows
@@ -446,6 +461,16 @@ def assert_scaling(args: argparse.Namespace, rows: list[Measurement]) -> None:
     ideal = args.communities / args.subscribed_communities
     min_reduction = ideal * args.min_reduction_ratio
     for row in rows:
+        # A row with no traffic cannot prove anything. Without this guard a dead
+        # scoped bus yields reduction=inf and irrelevant=0%, which passes both
+        # checks below.
+        if row.published <= 0 or row.old_cluster <= 0 or row.new_cluster <= 0:
+            raise AssertionError(
+                f"pods={row.pods}: no deliveries to assert on "
+                f"(published={row.published}, old={row.old_cluster}, new={row.new_cluster})"
+            )
+        if not math.isfinite(row.reduction):
+            raise AssertionError(f"pods={row.pods}: reduction is not finite ({row.reduction})")
         if row.reduction < min_reduction:
             raise AssertionError(
                 f"pods={row.pods}: reduction {row.reduction:.2f}× < required {min_reduction:.2f}×"
@@ -498,7 +523,23 @@ def print_rows(args: argparse.Namespace, rows: list[Measurement]) -> None:
     )
 
 
-def run(args: argparse.Namespace) -> int:
+def validate_args(args: argparse.Namespace) -> list[int]:
+    """Reject unusable scenario inputs before any socket is opened.
+
+    Returns the parsed pod counts. Raises ValueError on the first problem.
+    """
+    rate = args.events_per_community_per_sec
+    if not math.isfinite(rate) or rate <= 0:
+        raise ValueError(
+            f"--events-per-community-per-sec must be a finite positive number, got {rate}"
+        )
+    if args.mode == "redis" and rate != int(rate):
+        raise ValueError("--mode redis requires integer --events-per-community-per-sec")
+    if args.interested_pods_per_subscribed_community < 0:
+        raise ValueError(
+            "--interested-pods-per-subscribed-community must be 0 (all pods) or positive, "
+            f"got {args.interested_pods_per_subscribed_community}"
+        )
     if args.communities <= 0:
         raise ValueError("--communities must be positive")
     if args.subscribed_communities <= 0:
@@ -508,6 +549,11 @@ def run(args: argparse.Namespace) -> int:
     pods_values = [int(p.strip()) for p in args.pods.split(",") if p.strip()]
     if not pods_values or any(p <= 0 for p in pods_values):
         raise ValueError("--pods must contain positive integers")
+    return pods_values
+
+
+def run(args: argparse.Namespace) -> int:
+    pods_values = validate_args(args)
 
     rows = model_measurements(args, pods_values) if args.mode == "model" else redis_measurements(args, pods_values)
     print_rows(args, rows)
@@ -551,7 +597,14 @@ def main() -> int:
         help="minimum observed reduction as a fraction of ideal communities/subscribed",
     )
     parser.add_argument("--max-scoped-irrelevant-pct", type=float, default=0.0)
-    return run(parser.parse_args())
+    args = parser.parse_args()
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        # Usage error: report it the argparse way (stderr, exit status 2) before
+        # any connection is attempted. run() re-validates; that is cheap.
+        parser.error(str(exc))
+    return run(args)
 
 
 if __name__ == "__main__":
